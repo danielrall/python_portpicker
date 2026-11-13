@@ -1,3 +1,12 @@
+## Unreleased
+
+*   Only set `SO_REUSEADDR` on `SOCK_STREAM` (TCP) probe sockets. On UDP it
+    allowed binding over an active `SO_REUSEADDR` UDP socket, so
+    `is_port_free()` and `pick_unused_port()` could report occupied UDP ports
+    as free. On Linux with dual-stack `AF_INET6` (`IPV6_V6ONLY == 0`), skip the
+    redundant `AF_INET` UDP probe so lingering `AF_INET6` probe FDs (held
+    across concurrent `fork()` or `/proc/<pid>/fd` reads) cannot self-collide.
+
 ## 1.6.0
 
 *   Resolve an internal source of potential flakiness on the bind/close port

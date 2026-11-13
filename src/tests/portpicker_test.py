@@ -425,6 +425,94 @@ class PickUnusedPortTest(CommonTestMixin, unittest.TestCase):
             mock_sock.side_effect = socket.error('fake socket error', 0)
             self.assertFalse(portpicker.is_port_free(port))
 
+    def testUDPReuseAddrPortNotFree(self):
+        cases = [
+            (socket.AF_INET, '', None),
+            (socket.AF_INET, '127.0.0.1', None),
+        ]
+        if hasattr(socket, 'AF_INET6'):
+            cases.append((socket.AF_INET6, '', 1))
+            if not _winapi:
+                cases.append((socket.AF_INET6, '', 0))
+        for family, addr, v6only in cases:
+            try:
+                sock = socket.socket(family, socket.SOCK_DGRAM, 0)
+            except socket.error:
+                continue
+            with sock:
+                if v6only is not None and hasattr(socket, 'IPPROTO_IPV6'):
+                    try:
+                        sock.setsockopt(socket.IPPROTO_IPV6,
+                                        socket.IPV6_V6ONLY, v6only)
+                    except socket.error:
+                        pass
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((addr, 0))
+                port = sock.getsockname()[1]
+                self.assertFalse(portpicker.is_port_free(port))
+
+    def testIsPortFreeWithSocketLackingGetsockopt(self):
+        real_socket = socket.socket
+
+        class NoGetsockoptSocket(object):
+            """Delegates to a real socket but has no getsockopt()."""
+
+            def __init__(self, *args):
+                self._sock = real_socket(*args)
+
+            def __getattr__(self, name):
+                if name == 'getsockopt':
+                    raise AttributeError(name)
+                return getattr(self._sock, name)
+
+        port = portpicker.pick_unused_port()
+        with mock.patch.object(portpicker.socket, 'socket',
+                               NoGetsockoptSocket):
+            self.assertTrue(portpicker.is_port_free(port))
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and
+                         hasattr(socket, 'AF_INET6'),
+                         'Linux dual-stack AF_INET6 test')
+    def testDualStackSkipsIPv4ProbeOnLinux(self):
+        try:
+            probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, 0)
+        except socket.error:
+            self.skipTest('AF_INET6 unavailable')
+        with probe:
+            if probe.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) != 0:
+                self.skipTest('AF_INET6 is not dual-stack by default')
+
+        real_socket = socket.socket
+        probed = []
+
+        def recording_socket(family, socktype, *args):
+            probed.append((family, socktype))
+            return real_socket(family, socktype, *args)
+
+        port = portpicker.pick_unused_port()
+        with mock.patch.object(portpicker.socket, 'socket', recording_socket):
+            self.assertTrue(portpicker.is_port_free(port))
+        self.assertEqual(probed, [
+            (socket.AF_INET6, socket.SOCK_STREAM),
+            (socket.AF_INET6, socket.SOCK_DGRAM),
+        ])
+
+        probed.clear()
+        held = []
+        try:
+            with mock.patch.object(portpicker.socket, 'socket',
+                                   recording_socket):
+                bound_port = portpicker._bind(
+                    port, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+                    return_socket=held)
+            self.assertEqual(bound_port, port)
+            self.assertEqual(probed, [(socket.AF_INET6, socket.SOCK_DGRAM)])
+            self.assertEqual(len(held), 1)
+            self.assertEqual(held[0].family, socket.AF_INET6)
+        finally:
+            for sock in held:
+                sock.close()
+
     def testThatLegacyCapWordsAPIsExist(self):
         """The original APIs were CapWords style, 1.1 added PEP8 names."""
         self.assertEqual(portpicker.bind, portpicker.Bind)

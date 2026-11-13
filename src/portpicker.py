@@ -116,58 +116,90 @@ def bind(port, socket_type, socket_proto):
     return _bind(port, socket_type, socket_proto)
 
 
-def _bind(port, socket_type, socket_proto, return_socket=None,
-          return_family=socket.AF_INET6):
+def _bind(port, socket_type, socket_proto, return_socket=None):
     """Internal implementation of bind.
 
     Args:
       port, socket_type, socket_proto: see bind().
       return_socket: If supplied, a list that we will append an open bound
-          reuseaddr socket on the port in question to.
-      return_family: The socket family to return in return_socket.
+          socket on the port in question to (with SO_REUSEADDR set for
+          SOCK_STREAM only).
 
     Returns:
       The port number on success or None on failure.
     """
-    # Our return family must come last when returning a bound socket
-    # as we cannot keep it bound while testing a bind on the other
-    # family with many network stack configurations.
-    if return_socket is None or return_family == socket.AF_INET:
-        socket_families = (socket.AF_INET6, socket.AF_INET)
-    elif return_family == socket.AF_INET6:
-        socket_families = (socket.AF_INET, socket.AF_INET6)
-    else:
-        raise ValueError('unknown return_family %s' % return_family)
+    # On non-Linux platforms, probe AF_INET first and close it when returning a
+    # bound socket so AF_INET6 can stay bound last. On Linux, always probe
+    # AF_INET6 first: when IPV6_V6ONLY == 0, [::]:port already covers IPv4 in a
+    # single bind without closing a separate probe FD that could linger across
+    # concurrent fork() or /proc/<pid>/fd reads.
+    is_linux = sys.platform.startswith('linux')
+    socket_families = (
+        (socket.AF_INET6, socket.AF_INET) if (return_socket is None or is_linux)
+        else (socket.AF_INET, socket.AF_INET6))
     got_socket = False
-    for family in socket_families:
-        try:
-            sock = socket.socket(family, socket_type, socket_proto)
-            got_socket = True
-        except socket.error:
-            continue
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('', port))
-            if socket_type == socket.SOCK_STREAM:
-                sock.listen(1)
-            port = sock.getsockname()[1]
-        except socket.error:
-            return None
-        finally:
-            if return_socket is None or family != return_family:
-                try:
-                    # Adding this resolved 1 in ~500 flakiness that we were
-                    # seeing from an integration test framework managing a set
-                    # of ports with is_port_free().  close() doesn't move the
-                    # TCP state machine along quickly.
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                sock.close()
-        if return_socket is not None and family == return_family:
-            return_socket.append(sock)
-            break  # Final iteration due to pre-loop logic; don't close.
-    return port if got_socket else None
+    held_socket = None
+    try:
+        for family in socket_families:
+            try:
+                sock = socket.socket(family, socket_type, socket_proto)
+                got_socket = True
+            except socket.error:
+                continue
+            is_dual_stack = False
+            v6only = None
+            keep_socket = False
+            try:
+                if socket_type == socket.SOCK_STREAM:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(('', port))
+                if socket_type == socket.SOCK_STREAM:
+                    sock.listen(1)
+                if is_linux and family == socket.AF_INET6:
+                    # A dual-stack [::] bind (IPV6_V6ONLY == 0) already covers
+                    # IPv4. Skip the AF_INET probe: on Linux, a non-reuseaddr
+                    # socket stays bound after close() while a forked child or
+                    # /proc/<pid>/fd reader holds the file, which would collide.
+                    try:
+                        v6only = sock.getsockopt(socket.IPPROTO_IPV6,
+                                                 socket.IPV6_V6ONLY)
+                        is_dual_stack = (v6only == 0)
+                    except (socket.error, AttributeError):
+                        # Unknown, e.g. a test double without getsockopt():
+                        # probe AF_INET too.
+                        pass
+                port = sock.getsockname()[1]
+                if return_socket is not None and held_socket is None:
+                    keep_socket = (family == socket_families[-1] or
+                                   v6only is not None)
+            except socket.error:
+                return None
+            finally:
+                if not keep_socket:
+                    try:
+                        # Adding this resolved 1 in ~500 flakiness that we were
+                        # seeing from an integration test framework managing a
+                        # set of ports with is_port_free().  close() doesn't
+                        # move the TCP state machine along quickly.
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    sock.close()
+            if keep_socket:
+                held_socket = sock
+            if is_dual_stack:
+                break
+        if held_socket is not None:
+            return_socket.append(held_socket)
+            held_socket = None
+        return port if got_socket else None
+    finally:
+        if held_socket is not None:
+            try:
+                held_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            held_socket.close()
 
 
 def is_port_free(port):
@@ -231,9 +263,9 @@ def _pick_unused_port(pid=None, portserver_address=None,
       pid, portserver_address: See pick_unused_port().
       noserver_bind_timeout: If no portserver was used, this is the number of
         seconds we will attempt to keep a child process around with the ports
-        returned open and bound SO_REUSEADDR style to help avoid race condition
-        port reuse. A non-zero value attempts os.fork(). Do not use it in a
-        multithreaded process.
+        returned open and bound (with SO_REUSEADDR on TCP) to help avoid race
+        condition port reuse. A non-zero value attempts os.fork(). Do not use
+        it in a multithreaded process.
     """
     try:  # Instead of `if _free_ports:` to handle the race condition.
         port = _free_ports.pop()
@@ -301,7 +333,7 @@ def _pick_unused_port_without_server(bind_timeout=0):
 
     Args:
       bind_timeout: number of seconds to attempt to keep a child process
-          process around bound SO_REUSEADDR style to the port. If we cannot
+          around bound to the port (with SO_REUSEADDR on TCP). If we cannot
           do that we emit a warning to stderr.
 
     Returns:
@@ -462,8 +494,9 @@ def main(argv):
 
     A second optional argument can be a bind timeout in seconds that will be
     used ONLY if no portserver is found. We attempt to leave a process around
-    holding the port open and bound with SO_REUSEADDR set for timeout seconds.
-    If the timeout bind was not possible, a warning is emitted to stderr.
+    holding the port open and bound (with SO_REUSEADDR set on TCP) for timeout
+    seconds. If the timeout bind was not possible, a warning is emitted to
+    stderr.
 
       #!/bin/bash
       port="$(python -m portpicker $$ 1.23)"
